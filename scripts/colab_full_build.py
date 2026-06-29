@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import shutil
 import zipfile
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import orjson
+import torch
 from huggingface_hub import hf_hub_download
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer
 
+from nyayarag.chunking import token_chunks
 from nyayarag.config import get_settings
 from nyayarag.embeddings import load_embedding_model
 from nyayarag.preprocessing import extract_statute_chunks
@@ -52,16 +58,77 @@ def download_corpus(repo_id: str, filename: str, extract_dir: Path) -> Path:
     return jsons[0]
 
 
-def build_vectors(chunks: list[StatuteChunk], batch_size: int) -> list[list[float]]:
+def split_long_chunks(
+    chunks: list[StatuteChunk], max_tokens: int, overlap_tokens: int
+) -> list[StatuteChunk]:
     settings = get_settings()
-    model = load_embedding_model(settings)
-    vectors: list[list[float]] = []
-    texts = [chunk.text for chunk in chunks]
-    for start in tqdm(range(0, len(texts), batch_size), desc="Embedding statutes"):
-        batch = texts[start : start + batch_size]
-        encoded = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
-        vectors.extend(encoded.tolist())
-    return vectors
+    tokenizer = AutoTokenizer.from_pretrained(settings.embedding_model)
+
+    def encode(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    def decode(token_ids: list[int]) -> str:
+        return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    split: list[StatuteChunk] = []
+    for chunk in tqdm(chunks, desc="Token-splitting statute chunks"):
+        pieces = token_chunks(
+            chunk.text,
+            encode=encode,
+            decode=decode,
+            chunk_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            min_chunk_tokens=16,
+        ) or [chunk.text]
+        for piece_index, piece in enumerate(pieces):
+            suffix = f"__part_{piece_index:03d}" if len(pieces) > 1 else ""
+            payload = chunk.model_dump()
+            payload["statute_id"] = f"{chunk.statute_id}{suffix}"
+            payload["text"] = piece
+            if suffix:
+                payload["title"] = f"{chunk.title} (part {piece_index + 1}/{len(pieces)})"
+            split.append(StatuteChunk.model_validate(payload))
+    return split
+
+
+def build_qdrant_streaming(
+    chunks: list[StatuteChunk], batch_size: int, max_seq_length: int
+) -> None:
+    settings = get_settings()
+    model = load_embedding_model(settings, max_seq_length=max_seq_length)
+    qdrant = QdrantStatuteStore(settings.qdrant_path, settings.qdrant_collection)
+    qdrant.recreate(settings.embedding_dim)
+
+    for start in tqdm(range(0, len(chunks), batch_size), desc="Embedding/upserting statutes"):
+        batch_chunks = chunks[start : start + batch_size]
+        batch_texts = [chunk.text for chunk in batch_chunks]
+        try:
+            encoded = model.encode(
+                batch_texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=len(batch_texts),
+            )
+        except torch.OutOfMemoryError:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if len(batch_chunks) == 1:
+                raise
+            for offset, chunk in enumerate(batch_chunks):
+                encoded = model.encode(
+                    [chunk.text],
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=1,
+                )
+                qdrant.upsert([chunk], encoded.tolist(), point_id_offset=start + offset)
+            continue
+
+        qdrant.upsert(batch_chunks, encoded.tolist(), point_id_offset=start)
+        del encoded
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main() -> None:
@@ -75,6 +142,8 @@ def main() -> None:
         "--drive-output", default=Path("/content/drive/MyDrive/nyayarag_artifacts"), type=Path
     )
     parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--embed-max-tokens", default=512, type=int)
+    parser.add_argument("--embed-overlap-tokens", default=64, type=int)
     parser.add_argument("--limit", default=None, type=int)
     args = parser.parse_args()
 
@@ -91,14 +160,11 @@ def main() -> None:
 
     chunks_path = processed_dir / "statute_chunks.jsonl"
     chunks = extract_statute_chunks(records)
+    chunks = split_long_chunks(chunks, args.embed_max_tokens, args.embed_overlap_tokens)
     write_chunks(chunks, chunks_path)
     chunks = load_chunks(chunks_path)
 
-    vectors = build_vectors(chunks, args.batch_size)
-
-    qdrant = QdrantStatuteStore(settings.qdrant_path, settings.qdrant_collection)
-    qdrant.recreate(settings.embedding_dim)
-    qdrant.upsert(chunks, vectors)
+    build_qdrant_streaming(chunks, args.batch_size, args.embed_max_tokens)
 
     BM25Store.build(chunks).save(settings.bm25_path)
 

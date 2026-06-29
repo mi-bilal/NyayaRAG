@@ -24,13 +24,21 @@ class QdrantStatuteStore:
         )
 
     def upsert(
-        self, chunks: list[StatuteChunk], vectors: list[list[float]], batch_size: int = 128
+        self,
+        chunks: list[StatuteChunk],
+        vectors: list[list[float]],
+        batch_size: int = 128,
+        point_id_offset: int = 0,
     ) -> None:
         for start in range(0, len(chunks), batch_size):
             batch_chunks = chunks[start : start + batch_size]
             batch_vectors = vectors[start : start + batch_size]
             points = [
-                PointStruct(id=start + offset, vector=vector, payload=chunk.model_dump())
+                PointStruct(
+                    id=point_id_offset + start + offset,
+                    vector=vector,
+                    payload=chunk.model_dump(),
+                )
                 for offset, (chunk, vector) in enumerate(
                     zip(batch_chunks, batch_vectors, strict=True)
                 )

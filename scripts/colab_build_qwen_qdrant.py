@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import shutil
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import orjson
+import torch
 from tqdm.auto import tqdm
 
 from nyayarag.config import get_settings
@@ -32,6 +36,7 @@ def main() -> None:
         "--drive-output", default=Path("/content/drive/MyDrive/nyayarag_artifacts"), type=Path
     )
     parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--max-seq-length", default=512, type=int)
     args = parser.parse_args()
 
     settings = get_settings()
@@ -39,18 +44,25 @@ def main() -> None:
         os.environ["HF_TOKEN"] = settings.hf_token
 
     chunks = load_chunks(args.chunks)
-    model = load_embedding_model(settings)
-
-    texts = [chunk.text for chunk in chunks]
-    vectors = []
-    for start in tqdm(range(0, len(texts), args.batch_size), desc="Embedding statutes"):
-        batch = texts[start : start + args.batch_size]
-        encoded = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
-        vectors.extend(encoded.tolist())
-
+    model = load_embedding_model(settings, max_seq_length=args.max_seq_length)
     qdrant = QdrantStatuteStore(settings.qdrant_path, settings.qdrant_collection)
     qdrant.recreate(settings.embedding_dim)
-    qdrant.upsert(chunks, vectors)
+
+    texts = [chunk.text for chunk in chunks]
+    for start in tqdm(range(0, len(texts), args.batch_size), desc="Embedding statutes"):
+        batch_chunks = chunks[start : start + args.batch_size]
+        batch = [chunk.text for chunk in batch_chunks]
+        encoded = model.encode(
+            batch,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=len(batch),
+        )
+        qdrant.upsert(batch_chunks, encoded.tolist(), point_id_offset=start)
+        del encoded
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     bm25 = BM25Store.build(chunks)
     bm25.save(settings.bm25_path)
