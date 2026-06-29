@@ -1,0 +1,45 @@
+[project]
+name = "nyayarag"
+version = "0.1.0"
+description = "Streamlit legal RAG app for Indian Supreme Court case text and retrieved statutes."
+readme = "README.md"
+authors = [
+    { name = "Muhammad Bilal", email = "mbilalsaleem27@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "groq>=0.31.0",
+    "numpy>=1.26.0",
+    "orjson>=3.10.0",
+    "pandas>=2.2.0",
+    "pydantic>=2.8.0",
+    "python-dotenv>=1.0.1",
+    "qdrant-client>=1.12.0",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=3.0.0",
+    "streamlit>=1.37.0",
+    "torch>=2.3.0",
+    "tqdm>=4.66.0",
+    "transformers>=4.51.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+nyayarag = "nyayarag.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[build-system]
+requires = ["uv_build>=0.11.24,<0.12.0"]
+build-backend = "uv_build"
