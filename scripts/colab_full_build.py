@@ -12,6 +12,7 @@ from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import orjson
 import torch
 from huggingface_hub import hf_hub_download
@@ -21,7 +22,7 @@ from transformers import AutoTokenizer
 from nyayarag.chunking import token_chunks
 from nyayarag.config import get_settings
 from nyayarag.embeddings import load_embedding_model
-from nyayarag.preprocessing import extract_statute_chunks
+from nyayarag.preprocessing import extract_statute_chunks_with_stats
 from nyayarag.retrieval.bm25 import BM25Store
 from nyayarag.retrieval.qdrant_store import QdrantStatuteStore
 from nyayarag.schema import StatuteChunk
@@ -129,29 +130,38 @@ def split_long_chunks(
     return split
 
 
-def build_qdrant_streaming(
-    chunks: list[StatuteChunk], batch_size: int, max_seq_length: int, log_every: int
-) -> None:
+def encode_vectors_to_memmap(
+    chunks: list[StatuteChunk],
+    batch_size: int,
+    max_seq_length: int,
+    vector_cache: Path,
+    log_every: int,
+) -> np.memmap:
     settings = get_settings()
     log(f"[7/9] Loading embedding model on GPU/CPU: {settings.embedding_model}")
     model = load_embedding_model(settings, max_seq_length=max_seq_length)
     log(f"[7/9] Embedding model loaded with max_seq_length={model.max_seq_length}")
     show_gpu_status()
 
-    log(f"[8/9] Creating Qdrant collection at {settings.qdrant_path}")
-    qdrant = QdrantStatuteStore(settings.qdrant_path, settings.qdrant_collection)
-    qdrant.recreate(settings.embedding_dim)
+    vector_cache.parent.mkdir(parents=True, exist_ok=True)
+    vectors = np.memmap(
+        vector_cache,
+        dtype="float32",
+        mode="w+",
+        shape=(len(chunks), settings.embedding_dim),
+    )
 
     total_batches = (len(chunks) + batch_size - 1) // batch_size
     log(
-        f"[8/9] Embedding/upserting {len(chunks):,} chunks "
+        f"[8A/9] Encoding {len(chunks):,} chunks into {vector_cache} "
         f"in {total_batches:,} batches of {batch_size}"
     )
     for batch_index, start in enumerate(
-        tqdm(range(0, len(chunks), batch_size), desc="Embedding/upserting statutes"), start=1
+        tqdm(range(0, len(chunks), batch_size), desc="Encoding statute vectors"), start=1
     ):
         batch_chunks = chunks[start : start + batch_size]
         batch_texts = [chunk.text for chunk in batch_chunks]
+        end = start + len(batch_chunks)
         try:
             encoded = model.encode(
                 batch_texts,
@@ -175,20 +185,50 @@ def build_qdrant_streaming(
                     show_progress_bar=False,
                     batch_size=1,
                 )
-                qdrant.upsert([chunk], encoded.tolist(), point_id_offset=start + offset)
+                vectors[start + offset : start + offset + 1] = encoded.astype("float32")
                 del encoded
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             continue
 
-        qdrant.upsert(batch_chunks, encoded.tolist(), point_id_offset=start)
+        vectors[start:end] = encoded.astype("float32")
         del encoded
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         if batch_index == 1 or batch_index % log_every == 0 or batch_index == total_batches:
-            log(f"[8/9] Completed batch {batch_index:,}/{total_batches:,}")
+            vectors.flush()
+            log(f"[8A/9] Encoded batch {batch_index:,}/{total_batches:,}")
             show_gpu_status()
+    vectors.flush()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return vectors
+
+
+def bulk_upsert_qdrant(
+    chunks: list[StatuteChunk], vectors: np.memmap, upsert_batch_size: int, log_every: int
+) -> None:
+    settings = get_settings()
+    log(f"[8B/9] Creating Qdrant collection at {settings.qdrant_path}")
+    qdrant = QdrantStatuteStore(settings.qdrant_path, settings.qdrant_collection)
+    qdrant.recreate(settings.embedding_dim)
+
+    total_batches = (len(chunks) + upsert_batch_size - 1) // upsert_batch_size
+    log(
+        f"[8B/9] Bulk upserting {len(chunks):,} vectors "
+        f"in {total_batches:,} batches of {upsert_batch_size}"
+    )
+    for batch_index, start in enumerate(
+        tqdm(range(0, len(chunks), upsert_batch_size), desc="Bulk upserting Qdrant"), start=1
+    ):
+        end = min(start + upsert_batch_size, len(chunks))
+        qdrant.upsert(
+            chunks[start:end],
+            vectors[start:end].tolist(),
+            batch_size=upsert_batch_size,
+            point_id_offset=start,
+        )
+        if batch_index == 1 or batch_index % log_every == 0 or batch_index == total_batches:
+            log(f"[8B/9] Upserted batch {batch_index:,}/{total_batches:,}")
 
 
 def main() -> None:
@@ -202,8 +242,12 @@ def main() -> None:
         "--drive-output", default=Path("/content/drive/MyDrive/nyayarag_artifacts"), type=Path
     )
     parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--upsert-batch-size", default=1024, type=int)
     parser.add_argument("--embed-max-tokens", default=512, type=int)
     parser.add_argument("--embed-overlap-tokens", default=64, type=int)
+    parser.add_argument(
+        "--vector-cache", default=Path("artifacts/vector_cache/statute_vectors.npy"), type=Path
+    )
     parser.add_argument("--log-every", default=10, type=int)
     parser.add_argument("--limit", default=None, type=int)
     args = parser.parse_args()
@@ -232,14 +276,21 @@ def main() -> None:
 
     chunks_path = processed_dir / "statute_chunks.jsonl"
     log("[5/9] Extracting statute-like chunks from records")
-    chunks = extract_statute_chunks(records)
-    log(f"[5/9] Extracted {len(chunks):,} raw statute chunks")
+    chunks, extraction_stats = extract_statute_chunks_with_stats(records)
+    log(f"[5/9] Extraction stats: {json.dumps(extraction_stats.as_dict(), indent=2)}")
     chunks = split_long_chunks(chunks, args.embed_max_tokens, args.embed_overlap_tokens)
     log(f"[6/9] Writing processed chunks: {chunks_path}")
     write_chunks(chunks, chunks_path)
     chunks = load_chunks(chunks_path)
 
-    build_qdrant_streaming(chunks, args.batch_size, args.embed_max_tokens, args.log_every)
+    vectors = encode_vectors_to_memmap(
+        chunks,
+        args.batch_size,
+        args.embed_max_tokens,
+        args.vector_cache,
+        args.log_every,
+    )
+    bulk_upsert_qdrant(chunks, vectors, args.upsert_batch_size, args.log_every)
 
     log(f"[9/9] Building BM25 artifact: {settings.bm25_path}")
     BM25Store.build(chunks).save(settings.bm25_path)
@@ -252,6 +303,7 @@ def main() -> None:
         "embedding_dim": settings.embedding_dim,
         "qdrant_collection": settings.qdrant_collection,
         "statute_chunks": len(chunks),
+        "extraction_stats": extraction_stats.as_dict(),
     }
     (manifest_dir / "index_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"

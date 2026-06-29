@@ -158,7 +158,7 @@ If you previously cloned before this fix, update first:
 Run a small 500-record build to confirm the full workflow works before spending GPU time on the full corpus.
 
 ```python
-!uv run python scripts/colab_full_build.py --batch-size 4 --embed-max-tokens 384 --embed-overlap-tokens 48 --log-every 1 --limit 50
+!uv run python scripts/colab_full_build.py --batch-size 16 --upsert-batch-size 512 --embed-max-tokens 384 --embed-overlap-tokens 48 --log-every 1 --limit 50
 ```
 
 Expected output ends with something like:
@@ -173,7 +173,7 @@ After the small test succeeds:
 
 ```python
 !rm -rf artifacts
-!uv run python scripts/colab_full_build.py --batch-size 8 --embed-max-tokens 512 --embed-overlap-tokens 64 --log-every 10
+!uv run python scripts/colab_full_build.py --batch-size 64 --upsert-batch-size 1024 --embed-max-tokens 512 --embed-overlap-tokens 64 --log-every 10
 ```
 
 If Colab runs out of memory, retry with a smaller batch size:
