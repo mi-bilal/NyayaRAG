@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nyayarag.config import Settings
+from nyayarag.embeddings import load_embedding_model
 from nyayarag.retrieval.bm25 import BM25Store
 from nyayarag.retrieval.qdrant_store import QdrantStatuteStore
 from nyayarag.schema import RetrievedStatute, StatuteChunk
@@ -14,12 +15,10 @@ class RetrievalNotReadyError(RuntimeError):
 
 class HybridRetriever:
     def __init__(self, settings: Settings, bm25: BM25Store, qdrant: QdrantStatuteStore):
-        from sentence_transformers import SentenceTransformer
-
         self.settings = settings
         self.bm25 = bm25
         self.qdrant = qdrant
-        self.encoder = SentenceTransformer(settings.embedding_model)
+        self.encoder = load_embedding_model(settings)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> HybridRetriever:

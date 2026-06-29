@@ -141,12 +141,24 @@ drive.mount('/content/drive')
 
 This may take a few minutes the first time.
 
+This installs `accelerate` from `pyproject.toml`. The Colab scripts no longer use
+`device_map="auto"` or deprecated `tokenizer_kwargs`; they load Qwen3 directly on
+`cuda` when Colab exposes a GPU.
+
+If you previously cloned before this fix, update first:
+
+```python
+%cd /content/NyayaRAG
+!git pull origin main
+!uv sync --dev
+```
+
 ## 7. Do A Small Test Build First
 
 Run a small 500-record build to confirm the full workflow works before spending GPU time on the full corpus.
 
 ```python
-!uv run python scripts/colab_full_build.py --batch-size 32 --limit 500
+!uv run python scripts/colab_full_build.py --batch-size 16 --limit 500
 ```
 
 Expected output ends with something like:
@@ -161,14 +173,14 @@ After the small test succeeds:
 
 ```python
 !rm -rf artifacts
-!uv run python scripts/colab_full_build.py --batch-size 32
+!uv run python scripts/colab_full_build.py --batch-size 16
 ```
 
 If Colab runs out of memory, retry with a smaller batch size:
 
 ```python
 !rm -rf artifacts
-!uv run python scripts/colab_full_build.py --batch-size 16
+!uv run python scripts/colab_full_build.py --batch-size 8
 ```
 
 If you get a better GPU like A100/L4, you can try:

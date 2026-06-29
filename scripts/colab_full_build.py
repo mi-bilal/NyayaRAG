@@ -9,10 +9,10 @@ from pathlib import Path
 
 import orjson
 from huggingface_hub import hf_hub_download
-from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from nyayarag.config import get_settings
+from nyayarag.embeddings import load_embedding_model
 from nyayarag.preprocessing import extract_statute_chunks
 from nyayarag.retrieval.bm25 import BM25Store
 from nyayarag.retrieval.qdrant_store import QdrantStatuteStore
@@ -54,11 +54,7 @@ def download_corpus(repo_id: str, filename: str, extract_dir: Path) -> Path:
 
 def build_vectors(chunks: list[StatuteChunk], batch_size: int) -> list[list[float]]:
     settings = get_settings()
-    model = SentenceTransformer(
-        settings.embedding_model,
-        model_kwargs={"device_map": "auto"},
-        tokenizer_kwargs={"padding_side": "left"},
-    )
+    model = load_embedding_model(settings)
     vectors: list[list[float]] = []
     texts = [chunk.text for chunk in chunks]
     for start in tqdm(range(0, len(texts), batch_size), desc="Embedding statutes"):

@@ -7,10 +7,10 @@ import shutil
 from pathlib import Path
 
 import orjson
-from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
 from nyayarag.config import get_settings
+from nyayarag.embeddings import load_embedding_model
 from nyayarag.retrieval.bm25 import BM25Store
 from nyayarag.retrieval.qdrant_store import QdrantStatuteStore
 from nyayarag.schema import StatuteChunk
@@ -39,11 +39,7 @@ def main() -> None:
         os.environ["HF_TOKEN"] = settings.hf_token
 
     chunks = load_chunks(args.chunks)
-    model = SentenceTransformer(
-        settings.embedding_model,
-        model_kwargs={"device_map": "auto"},
-        tokenizer_kwargs={"padding_side": "left"},
-    )
+    model = load_embedding_model(settings)
 
     texts = [chunk.text for chunk in chunks]
     vectors = []
